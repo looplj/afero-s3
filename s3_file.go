@@ -1,4 +1,3 @@
-// Package s3 brings S3 files handling to afero
 package s3
 
 import (
@@ -13,11 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spf13/afero"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/spf13/afero"
 )
 
 // File represents a file in S3.
@@ -64,6 +62,7 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 	if f.readdirNotTruncated {
 		return nil, io.EOF
 	}
+
 	if n <= 0 {
 		return f.ReaddirAll()
 	}
@@ -75,25 +74,36 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 	if name != "" && !strings.HasSuffix(name, "/") {
 		name += "/"
 	}
+
+	// Use StartAfter to skip the directory marker itself when listing
+	// This avoids issues with MinIO/S3 pagination when directory markers are present
+	var startAfter *string
+
+	if f.readdirContinuationToken == nil && name != "" {
+		// On first request, skip the directory marker by using StartAfter
+		dirMarker := strings.TrimSuffix(name, "/")
+		startAfter = &dirMarker
+	}
+
 	output, err := f.fs.client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
 		ContinuationToken: f.readdirContinuationToken,
 		Bucket:            aws.String(f.fs.bucket),
 		Prefix:            &name,
 		Delimiter:         aws.String("/"),
-		MaxKeys:           int32(n),
+		MaxKeys:           aws.Int32(int32(n)), //nolint:gosec //Checked.
+		StartAfter:        startAfter,
 	})
 	if err != nil {
 		return nil, err
 	}
-	f.readdirContinuationToken = output.NextContinuationToken
-	if !output.IsTruncated {
-		f.readdirNotTruncated = true
-	}
 
-	var fis = make([]os.FileInfo, 0, len(output.CommonPrefixes)+len(output.Contents))
+	isTruncated := aws.ToBool(output.IsTruncated)
+
+	fis := make([]os.FileInfo, 0, len(output.CommonPrefixes)+len(output.Contents))
 	for _, subfolder := range output.CommonPrefixes {
 		fis = append(fis, NewFileInfo(path.Base("/"+*subfolder.Prefix), true, 0, time.Unix(0, 0)))
 	}
+
 	for k := range output.Contents {
 		fileObject := &output.Contents[k]
 		if strings.HasSuffix(*fileObject.Key, "/") {
@@ -101,7 +111,19 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 			continue
 		}
 
-		fis = append(fis, NewFileInfo(path.Base("/"+*fileObject.Key), false, fileObject.Size, *fileObject.LastModified))
+		fis = append(fis, NewFileInfo(path.Base("/"+*fileObject.Key), false, aws.ToInt64(fileObject.Size), *fileObject.LastModified))
+	}
+
+	// Update pagination state after processing results
+	f.readdirContinuationToken = output.NextContinuationToken
+	if !isTruncated {
+		f.readdirNotTruncated = true
+	}
+
+	// If we got 0 items but S3 says there are more, it means we only got directory markers.
+	// Make one more request to try to get actual content.
+	if len(fis) == 0 && isTruncated {
+		return f.Readdir(n)
 	}
 
 	return fis, nil
@@ -110,9 +132,11 @@ func (f *File) Readdir(n int) ([]os.FileInfo, error) {
 // ReaddirAll provides list of file cachedInfo.
 func (f *File) ReaddirAll() ([]os.FileInfo, error) {
 	var fileInfos []os.FileInfo
+
 	for {
 		infos, err := f.Readdir(100)
 		fileInfos = append(fileInfos, infos...)
+
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
@@ -121,6 +145,7 @@ func (f *File) ReaddirAll() ([]os.FileInfo, error) {
 			}
 		}
 	}
+
 	return fileInfos, nil
 }
 
@@ -146,6 +171,7 @@ func (f *File) Readdirnames(n int) ([]string, error) {
 	for i, f := range fi {
 		_, names[i] = path.Split(f.Name())
 	}
+
 	return names, nil
 }
 
@@ -156,6 +182,7 @@ func (f *File) Stat() (os.FileInfo, error) {
 	if err == nil {
 		f.cachedInfo = info
 	}
+
 	return info, err
 }
 
@@ -187,6 +214,7 @@ func (f *File) Close() error {
 		defer func() {
 			f.streamRead = nil
 		}()
+
 		return f.streamRead.Close()
 	}
 
@@ -206,6 +234,7 @@ func (f *File) Close() error {
 		// might be rather slow.
 		err := <-f.streamWriteCloseErr
 		close(f.streamWriteCloseErr)
+
 		return err
 	}
 
@@ -222,7 +251,6 @@ func (f *File) Read(p []byte) (int, error) {
 	}
 
 	n, err := f.streamRead.Read(p)
-
 	if err == nil {
 		f.streamReadOffset += int64(n)
 	}
@@ -237,9 +265,11 @@ func (f *File) Read(p []byte) (int, error) {
 func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 	_, err = f.Seek(off, io.SeekStart)
 	if err != nil {
-		return
+		return n, err
 	}
+
 	n, err = f.Read(p)
+
 	return n, err
 }
 
@@ -278,6 +308,7 @@ func (f *File) seekRead(offset int64, whence int) (int64, error) {
 	if err := f.streamRead.Close(); err != nil {
 		return 0, fmt.Errorf("couldn't close previous stream: %w", err)
 	}
+
 	f.streamRead = nil
 
 	if startByte < 0 {
@@ -292,7 +323,6 @@ func (f *File) seekRead(offset int64, whence int) (int64, error) {
 // Write returns a non-nil error when n != len(b).
 func (f *File) Write(p []byte) (int, error) {
 	n, err := f.streamWrite.Write(p)
-
 	// If we have an error, it's only the "read/write on closed pipe" and we
 	// should report the underlying one
 	if err != nil {
@@ -332,7 +362,6 @@ func (f *File) openWriteStream() error {
 		}
 
 		_, err := uploader.Upload(context.Background(), input)
-
 		if err != nil {
 			f.streamWriteErr = err
 			_ = f.streamWrite.Close()
@@ -341,6 +370,7 @@ func (f *File) openWriteStream() error {
 		f.streamWriteCloseErr <- err
 		// close(f.streamWriteCloseErr)
 	}()
+
 	return nil
 }
 
@@ -366,6 +396,7 @@ func (f *File) openReadStream(startAt int64) error {
 
 	f.streamReadOffset = startAt
 	f.streamRead = resp.Body
+
 	return nil
 }
 
@@ -375,8 +406,10 @@ func (f *File) openReadStream(startAt int64) error {
 func (f *File) WriteAt(p []byte, off int64) (n int, err error) {
 	_, err = f.Seek(off, 0)
 	if err != nil {
-		return
+		return n, err
 	}
+
 	n, err = f.Write(p)
+
 	return n, err
 }

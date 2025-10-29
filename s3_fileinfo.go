@@ -1,4 +1,3 @@
-// Package s3 brings S3 files handling to afero
 package s3
 
 import (
@@ -40,9 +39,10 @@ func (fi FileInfo) Size() int64 {
 // available on the bucket.
 func (fi FileInfo) Mode() os.FileMode {
 	if fi.directory {
-		return 0755
+		return 0o755
 	}
-	return 0664
+
+	return 0o664
 }
 
 // ModTime provides the last modification time.
@@ -50,12 +50,12 @@ func (fi FileInfo) ModTime() time.Time {
 	return fi.modTime
 }
 
-// IsDir provides the abbreviation for Mode().IsDir()
+// IsDir provides the abbreviation for Mode().IsDir().
 func (fi FileInfo) IsDir() bool {
 	return fi.directory
 }
 
-// Sys provides the underlying data source (can return nil)
+// Sys provides the underlying data source (can return nil).
 func (fi FileInfo) Sys() interface{} {
 	return nil
 }

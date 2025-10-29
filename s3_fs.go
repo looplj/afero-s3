@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"mime"
 	"os"
 	"path"
@@ -30,7 +29,7 @@ type Fs struct {
 	bucket string // Bucket name
 }
 
-// UploadedFileProperties defines all the set properties applied to future files
+// UploadedFileProperties defines all the set properties applied to future files.
 type UploadedFileProperties struct {
 	CacheControl *string // CacheControl defines the Cache-Control header
 	ContentType  *string // ContentType define the Content-Type header
@@ -46,7 +45,7 @@ func NewFsFromConfig(bucket string, config aws.Config) *Fs {
 	}
 }
 
-// NewFsFromClient creates a new Fs instance from a S3 client
+// NewFsFromClient creates a new Fs instance from a S3 client.
 func NewFsFromClient(bucket string, client *s3.Client) *Fs {
 	return &Fs{
 		bucket: bucket,
@@ -54,16 +53,16 @@ func NewFsFromClient(bucket string, client *s3.Client) *Fs {
 	}
 }
 
-// ErrNotImplemented is returned when this operation is not (yet) implemented
+// ErrNotImplemented is returned when this operation is not (yet) implemented.
 var ErrNotImplemented = errors.New("not implemented")
 
-// ErrNotSupported is returned when this operations is not supported by S3
+// ErrNotSupported is returned when this operations is not supported by S3.
 var ErrNotSupported = errors.New("s3 doesn't support this operation")
 
-// ErrAlreadyOpened is returned when the file is already opened
+// ErrAlreadyOpened is returned when the file is already opened.
 var ErrAlreadyOpened = errors.New("already opened")
 
-// ErrInvalidSeek is returned when the seek operation is not doable
+// ErrInvalidSeek is returned when the seek operation is not doable.
 var ErrInvalidSeek = errors.New("invalid seek offset")
 
 // Name returns the type of FS object this is: Fs.
@@ -93,7 +92,7 @@ func (fs *Fs) Create(name string) (afero.File, error) {
 		}
 	}
 
-	file, err := fs.OpenFile(name, os.O_WRONLY, 0750)
+	file, err := fs.OpenFile(name, os.O_WRONLY, 0o750)
 	if err != nil {
 		return file, err
 	}
@@ -102,6 +101,7 @@ func (fs *Fs) Create(name string) (afero.File, error) {
 	// To protect against unexpected behavior, have this method
 	// wait until S3 reports the object exists.
 	waiter := s3.NewObjectExistsWaiter(fs.client)
+
 	return file, waiter.Wait(context.Background(), &s3.HeadObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
@@ -111,10 +111,13 @@ func (fs *Fs) Create(name string) (afero.File, error) {
 // Mkdir makes a directory in S3.
 func (fs *Fs) Mkdir(name string, perm os.FileMode) error {
 	name = sanitize(name)
-	file, err := fs.OpenFile(fmt.Sprintf("%s/", path.Clean(name)), os.O_CREATE, perm)
-	if err == nil {
-		err = file.Close()
-	}
+	// Create a directory marker object
+	_, err := fs.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(path.Clean(name) + "/"),
+		Body:   bytes.NewReader([]byte{}),
+	})
+
 	return err
 }
 
@@ -125,7 +128,7 @@ func (fs *Fs) MkdirAll(path string, perm os.FileMode) error {
 
 // Open a file for reading.
 func (fs *Fs) Open(name string) (afero.File, error) {
-	return fs.OpenFile(name, os.O_RDONLY, 0777)
+	return fs.OpenFile(name, os.O_RDONLY, 0o777)
 }
 
 // OpenFile opens a file.
@@ -169,12 +172,13 @@ func (fs *Fs) OpenFile(name string, flag int, _ os.FileMode) (afero.File, error)
 	return file, file.openReadStream(0)
 }
 
-// Remove a file
+// Remove a file.
 func (fs *Fs) Remove(name string) error {
 	name = sanitize(name)
 	if _, err := fs.Stat(name); err != nil {
 		return err
 	}
+
 	return fs.forceRemove(name)
 }
 
@@ -184,6 +188,7 @@ func (fs *Fs) forceRemove(name string) error {
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(name),
 	})
+
 	return err
 }
 
@@ -192,10 +197,12 @@ func (fs *Fs) RemoveAll(name string) error {
 	name = sanitize(name)
 
 	s3dir := NewFile(fs, name)
+
 	fis, err := s3dir.Readdir(0)
 	if err != nil {
 		return err
 	}
+
 	for _, fi := range fis {
 		fullpath := path.Join(s3dir.Name(), fi.Name())
 		if fi.IsDir() {
@@ -212,6 +219,7 @@ func (fs *Fs) RemoveAll(name string) error {
 	if err := fs.forceRemove(s3dir.Name() + "/"); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -226,6 +234,7 @@ func (fs *Fs) Rename(oldname, newname string) error {
 	if oldname == newname {
 		return nil
 	}
+
 	_, err := fs.client.CopyObject(context.Background(), &s3.CopyObjectInput{
 		Bucket:     aws.String(fs.bucket),
 		CopySource: aws.String(fs.bucket + "/" + oldname),
@@ -234,10 +243,12 @@ func (fs *Fs) Rename(oldname, newname string) error {
 	if err != nil {
 		return err
 	}
+
 	_, err = fs.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
 		Bucket: aws.String(fs.bucket),
 		Key:    aws.String(oldname),
 	})
+
 	return err
 }
 
@@ -261,13 +272,15 @@ func (fs *Fs) Stat(name string) (os.FileInfo, error) {
 		if errors.As(err, &ae) && ae.ErrorCode() == "NotFound" {
 			return fs.statDirectory(name)
 		}
+
 		return FileInfo{}, &os.PathError{
 			Op:   "stat",
 			Path: name,
 			Err:  err,
 		}
 	}
-	return NewFileInfo(path.Base(name), false, out.ContentLength, *out.LastModified), nil
+
+	return NewFileInfo(path.Base(name), false, aws.ToInt64(out.ContentLength), *out.LastModified), nil
 }
 
 func (fs *Fs) statDirectory(name string) (os.FileInfo, error) {
@@ -279,7 +292,7 @@ func (fs *Fs) statDirectory(name string) (os.FileInfo, error) {
 	out, err := fs.client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
 		Bucket:  aws.String(fs.bucket),
 		Prefix:  aws.String(name),
-		MaxKeys: 1,
+		MaxKeys: aws.Int32(1),
 	})
 	if err != nil {
 		return FileInfo{}, &os.PathError{
@@ -288,17 +301,19 @@ func (fs *Fs) statDirectory(name string) (os.FileInfo, error) {
 			Err:  err,
 		}
 	}
-	if out.KeyCount == 0 && name != "" {
+
+	if aws.ToInt32(out.KeyCount) == 0 && name != "" {
 		return nil, &os.PathError{
 			Op:   "stat",
 			Path: name,
 			Err:  os.ErrNotExist,
 		}
 	}
+
 	return NewFileInfo(path.Base(name), true, 0, time.Unix(0, 0)), nil
 }
 
-// Chmod doesn't exists in S3 but could be implemented by analyzing ACLs
+// Chmod doesn't exists in S3 but could be implemented by analyzing ACLs.
 func (fs *Fs) Chmod(name string, mode os.FileMode) error {
 	name = sanitize(name)
 
@@ -321,6 +336,7 @@ func (fs *Fs) Chmod(name string, mode os.FileMode) error {
 		Key:    aws.String(name),
 		ACL:    types.ObjectCannedACL(acl),
 	})
+
 	return err
 }
 
@@ -330,7 +346,7 @@ func (Fs) Chown(string, int, int) error {
 }
 
 // Chtimes could be implemented if needed, but that would require to override object properties using metadata,
-// which makes it a non-standard solution
+// which makes it a non-standard solution.
 func (Fs) Chtimes(string, time.Time, time.Time) error {
 	return ErrNotSupported
 }
